@@ -1,0 +1,105 @@
+# Technical Specifications
+
+## 1. System Overview
+
+Nexora uses an **FPGA + ESP32 architecture** for real-time accident detection and emergency alerting.
+  
+
+## 2. Main Components
+
+| Component            | Role                           | Interface      |
+| -------------------- | ------------------------------ | -------------- |
+| **Nexys 4 DDR FPGA** | Accident processing & decision | Digital / UART |
+| **ESP32**            | Communication gateway          | UART           |
+| **Shock Sensor**     | Impact detection               | Digital        |
+| **MPU6050**          | Acceleration & motion sensing  | I²C            |
+| **NEO-6M GPS**       | Location acquisition           | UART           |
+| **SIM800L GSM**      | Emergency SMS                  | UART           |
+
+
+## 3. FPGA Processing
+
+The FPGA performs the time-critical accident logic:
+
+```
+Sensor Inputs
+     ↓
+Impact Validation
+     ↓
+Risk Classification
+     ↓
+Accident FSM
+     ↓
+Accident Event
+     ↓
+UART → ESP32
+```
+
+### Key Parameters
+
+| Parameter         |            Value |
+| ----------------- | ---------------: |
+| Validation window |       **250 ms** |
+| Impact criterion  |          **70%** |
+| Decision logic    | **Accident FSM** |
+| FPGA HDL          |      **Verilog** |
+
+
+## 4. ESP32 Communication
+
+The ESP32 receives the confirmed accident event from the FPGA and handles external communication.
+
+```
+FPGA
+ ↓
+ESP32
+ ├──→ NEO-6M → GPS Location
+ └──→ SIM800L → Emergency SMS
+```
+
+---
+
+## 5. Accident Detection Flow
+
+```text
+Impact Detected
+      ↓
+250 ms Validation
+      ↓
+70% Criterion
+      ↓
+Acceleration + Speed Drop
+      ↓
+Accident Decision
+      ↓
+GPS Location
+      ↓
+GSM Emergency Alert
+```
+
+## 6. Development Requirements
+
+### FPGA
+
+* Xilinx Vivado
+* Verilog HDL
+* RTL simulator
+
+### ESP32
+
+* Arduino IDE
+* ESP32 board support
+
+## 7. Key Design Trade-off
+
+**Advantage:** Deterministic FPGA-based accident processing with communication handled separately by the ESP32.
+
+**Trade-off:** Additional hardware and greater system-design complexity.
+
+## Design Diagrams
+
+The following diagram illustrates the Nexora system architecture and accident-alert flow.
+
+![Design Diagrams](docs/design-diagrams/design-diagrams.png)
+
+
