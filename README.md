@@ -9,22 +9,6 @@ Unlike simple impact-based systems, our project does not treat every shock as an
 
 The **FPGA** performs the real-time accident validation and decision-making, while an **ESP32** handles communication with the **NEO-6M GPS** and **SIM800L GSM** module.
 
-### System Flow
-Impact / Acceleration / Speed
-              ↓
-             FPGA
-              ↓
-     Impact Validation
-              ↓
-     Accident Analysis
-              ↓
-       Accident Decision
-              ↓
-            ESP32
-          ↙       ↘
-       GPS        GSM
-        ↓           ↓
-    Location → Emergency SMS
 
 # 2. Requirements
 
