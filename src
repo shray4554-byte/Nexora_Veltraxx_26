@@ -1,0 +1,751 @@
+**.v file**
+`timescale 1ns / 1ps
+
+// ================================================================
+// NEXORA - FPGA ACCIDENT DETECTION SYSTEM
+// Board : Digilent Nexys 4 DDR
+// Tool  : Xilinx Vivado
+//
+// Connections:
+// Shock sensor D0 -> JA1 / C17
+// FPGA UART TX    -> JA3 / E18 -> ESP32 GPIO16
+//
+// Accident condition:
+//   1. Shock is validated over 250 ms
+//   2. >= 70% of samples are HIGH
+//      70% of 250 = 175 samples
+//   3. Large acceleration change
+//   4. Sudden speed drop
+//
+// Accident = Impact_valid AND Delta_Acceleration AND Speed_Drop
+//
+// UART packet:
+//   0xAA | STATUS | FRAME | CRC8
+//
+// STATUS:
+//   00 = SAFE
+//   01 = WARNING
+//   02 = CRITICAL
+//   03 = ACCIDENT
+// ================================================================
+
+module nexora_accident_system #(
+    parameter integer CLK_FREQ_HZ = 100_000_000,
+    parameter integer BAUD_RATE   = 115_200
+)(
+    input  wire       CLK100MHZ,
+    input  wire       CPU_RESETN,
+
+    input  wire [5:0] SW,
+    input  wire       SHOCK_IN,
+
+    output wire       UART_TX,
+    output wire [7:0] LED
+);
+
+    // Active-low reset
+    wire rst;
+    assign rst = ~CPU_RESETN;
+
+
+    // ============================================================
+    // 1 ms sampling clock
+    // ============================================================
+
+    localparam integer SAMPLE_DIV = CLK_FREQ_HZ / 1000;
+
+    reg [26:0] sample_counter;
+    reg        sample_tick;
+
+    always @(posedge CLK100MHZ) begin
+
+        if (rst) begin
+            sample_counter <= 27'd0;
+            sample_tick    <= 1'b0;
+        end
+
+        else if (sample_counter == SAMPLE_DIV-1) begin
+            sample_counter <= 27'd0;
+            sample_tick    <= 1'b1;
+        end
+
+        else begin
+            sample_counter <= sample_counter + 1'b1;
+            sample_tick    <= 1'b0;
+        end
+
+    end
+
+
+    // ============================================================
+    // SHOCK VALIDATION
+    //
+    // Window = 250 samples
+    // Sampling = 1 ms
+    // Window time = 250 ms
+    //
+    // Required HIGH samples = 175
+    // 175 / 250 = 70%
+    // ============================================================
+
+    localparam integer WINDOW_SIZE  = 250;
+    localparam integer REQUIRED_HIGH = 175;
+
+    reg [249:0] shock_history;
+
+    reg [7:0] window_pointer;
+
+    reg [8:0] high_count;
+
+    reg [8:0] sample_count;
+
+    reg       impact_valid;
+
+    reg [8:0] next_high_count;
+
+
+    // Calculate new HIGH count:
+    // remove old sample + add current sample
+
+    always @(*) begin
+
+        next_high_count = high_count;
+
+        if (shock_history[window_pointer] == 1'b1)
+            next_high_count = next_high_count - 1'b1;
+
+        if (SHOCK_IN == 1'b1)
+            next_high_count = next_high_count + 1'b1;
+
+    end
+
+
+    always @(posedge CLK100MHZ) begin
+
+        if (rst) begin
+
+            shock_history <= 250'd0;
+
+            window_pointer <= 8'd0;
+
+            high_count <= 9'd0;
+
+            sample_count <= 9'd0;
+
+            impact_valid <= 1'b0;
+
+        end
+
+        else if (sample_tick) begin
+
+            // Store current shock sample
+            shock_history[window_pointer] <= SHOCK_IN;
+
+            // Update HIGH counter
+            high_count <= next_high_count;
+
+
+            // Move circular pointer
+            if (window_pointer == WINDOW_SIZE-1)
+                window_pointer <= 8'd0;
+            else
+                window_pointer <= window_pointer + 1'b1;
+
+
+            // Wait until complete 250 ms window
+            if (sample_count < WINDOW_SIZE) begin
+
+                sample_count <= sample_count + 1'b1;
+
+                impact_valid <= 1'b0;
+
+            end
+
+            else begin
+
+                if (next_high_count >= REQUIRED_HIGH)
+                    impact_valid <= 1'b1;
+                else
+                    impact_valid <= 1'b0;
+
+            end
+
+        end
+
+    end
+
+
+    // ============================================================
+    // SENSOR INPUTS
+    //
+    // These switches are currently used for demonstration.
+    //
+    // SW1 = large acceleration change
+    // SW2 = sudden speed drop
+    // SW3 = high speed
+    // SW4 = short distance
+    // SW5 = very short distance
+    //
+    // Later these can be replaced by actual sensor-processing
+    // outputs from MPU6050 / Hall / distance sensor.
+    // ============================================================
+
+    wire large_delta_acceleration;
+
+    wire sudden_speed_drop;
+
+    wire high_speed;
+
+    wire short_distance;
+
+    wire very_short_distance;
+
+
+    assign large_delta_acceleration = SW[1];
+
+    assign sudden_speed_drop = SW[2];
+
+    assign high_speed = SW[3];
+
+    assign short_distance = SW[4];
+
+    assign very_short_distance = SW[5];
+
+
+    // ============================================================
+    // ACCIDENT DECISION
+    // ============================================================
+
+    wire accident_detected;
+
+    assign accident_detected =
+                impact_valid
+                &&
+                large_delta_acceleration
+                &&
+                sudden_speed_drop;
+
+
+    // ============================================================
+    // SAFETY FSM
+    //
+    // SAFE
+    // WARNING
+    // CRITICAL
+    // ACCIDENT
+    // ============================================================
+
+    localparam [2:0] SAFE_STATE     = 3'd0;
+    localparam [2:0] WARNING_STATE  = 3'd1;
+    localparam [2:0] CRITICAL_STATE = 3'd2;
+    localparam [2:0] ACCIDENT_STATE = 3'd3;
+
+
+    reg [2:0] current_state;
+
+    reg [2:0] next_state;
+
+
+    always @(*) begin
+
+        if (accident_detected)
+
+            next_state = ACCIDENT_STATE;
+
+        else if (high_speed && very_short_distance)
+
+            next_state = CRITICAL_STATE;
+
+        else if (high_speed || short_distance)
+
+            next_state = WARNING_STATE;
+
+        else
+
+            next_state = SAFE_STATE;
+
+    end
+
+
+    always @(posedge CLK100MHZ) begin
+
+        if (rst)
+
+            current_state <= SAFE_STATE;
+
+        else
+
+            current_state <= next_state;
+
+    end
+
+
+    // ============================================================
+    // STATUS BYTE
+    // ============================================================
+
+    reg [7:0] status_byte;
+
+
+    always @(*) begin
+
+        case (current_state)
+
+            SAFE_STATE:
+                status_byte = 8'h00;
+
+            WARNING_STATE:
+                status_byte = 8'h01;
+
+            CRITICAL_STATE:
+                status_byte = 8'h02;
+
+            ACCIDENT_STATE:
+                status_byte = 8'h03;
+
+            default:
+                status_byte = 8'h00;
+
+        endcase
+
+    end
+
+
+    // ============================================================
+    // LED INDICATION
+    //
+    // LED0 = SAFE
+    // LED1 = WARNING
+    // LED2 = CRITICAL
+    // LED3 = ACCIDENT
+    // LED4 = VALIDATED IMPACT
+    // LED5 = RAW SHOCK
+    // LED6 = ACCELERATION CHANGE
+    // LED7 = SPEED DROP
+    // ============================================================
+
+    assign LED[0] = (current_state == SAFE_STATE);
+
+    assign LED[1] = (current_state == WARNING_STATE);
+
+    assign LED[2] = (current_state == CRITICAL_STATE);
+
+    assign LED[3] = (current_state == ACCIDENT_STATE);
+
+    assign LED[4] = impact_valid;
+
+    assign LED[5] = SHOCK_IN;
+
+    assign LED[6] = large_delta_acceleration;
+
+    assign LED[7] = sudden_speed_drop;
+
+
+    // ============================================================
+    // CRC-8
+    //
+    // Polynomial = x^8 + x^2 + x + 1
+    // Hex = 0x07
+    // Initial = 0x00
+    // ============================================================
+
+    function [7:0] crc8_byte;
+
+        input [7:0] crc_input;
+
+        input [7:0] data_input;
+
+        integer i;
+
+        reg [7:0] crc;
+
+        begin
+
+            crc = crc_input ^ data_input;
+
+            for (i = 0; i < 8; i = i + 1) begin
+
+                if (crc[7])
+
+                    crc = {crc[6:0],1'b0} ^ 8'h07;
+
+                else
+
+                    crc = {crc[6:0],1'b0};
+
+            end
+
+            crc8_byte = crc;
+
+        end
+
+    endfunction
+
+
+    // ============================================================
+    // 1 SECOND HEARTBEAT
+    // ============================================================
+
+    reg [26:0] heartbeat_counter;
+
+    reg        packet_request;
+
+
+    always @(posedge CLK100MHZ) begin
+
+        if (rst) begin
+
+            heartbeat_counter <= 27'd0;
+
+            packet_request <= 1'b0;
+
+        end
+
+        else if (heartbeat_counter == CLK_FREQ_HZ-1) begin
+
+            heartbeat_counter <= 27'd0;
+
+            packet_request <= 1'b1;
+
+        end
+
+        else begin
+
+            heartbeat_counter <= heartbeat_counter + 1'b1;
+
+            packet_request <= 1'b0;
+
+        end
+
+    end
+
+
+    // ============================================================
+    // UART INSTANCE
+    // ============================================================
+
+    reg [7:0] tx_data;
+
+    reg       tx_start;
+
+    wire      tx_busy;
+
+    wire      tx_done;
+
+
+    uart_tx #(
+        .CLK_FREQ_HZ(CLK_FREQ_HZ),
+        .BAUD_RATE(BAUD_RATE)
+    )
+    UART_MODULE (
+
+        .clk(CLK100MHZ),
+
+        .rst(rst),
+
+        .data_in(tx_data),
+
+        .start(tx_start),
+
+        .tx(UART_TX),
+
+        .busy(tx_busy),
+
+        .done(tx_done)
+
+    );
+
+
+    // ============================================================
+    // UART PACKET FSM
+    // ============================================================
+
+    localparam [2:0] PACKET_IDLE = 3'd0;
+
+    localparam [2:0] PACKET_SEND = 3'd1;
+
+    localparam [2:0] PACKET_WAIT = 3'd2;
+
+    localparam [2:0] PACKET_DONE = 3'd3;
+
+
+    reg [2:0] packet_state;
+
+    reg [1:0] byte_index;
+
+    reg [7:0] frame_counter;
+
+    reg [7:0] saved_status;
+
+    reg [7:0] saved_frame;
+
+    reg [7:0] saved_crc;
+
+
+    always @(posedge CLK100MHZ) begin
+
+        if (rst) begin
+
+            packet_state <= PACKET_IDLE;
+
+            byte_index <= 2'd0;
+
+            frame_counter <= 8'd0;
+
+            saved_status <= 8'd0;
+
+            saved_frame <= 8'd0;
+
+            saved_crc <= 8'd0;
+
+            tx_data <= 8'd0;
+
+            tx_start <= 1'b0;
+
+        end
+
+        else begin
+
+            tx_start <= 1'b0;
+
+
+            case (packet_state)
+
+
+                PACKET_IDLE: begin
+
+                    if (packet_request) begin
+
+                        saved_status <= status_byte;
+
+                        saved_frame <= frame_counter;
+
+
+                        saved_crc <=
+                            crc8_byte(
+                                crc8_byte(
+                                    crc8_byte(
+                                        8'h00,
+                                        8'hAA
+                                    ),
+                                    status_byte
+                                ),
+                                frame_counter
+                            );
+
+
+                        frame_counter <= frame_counter + 1'b1;
+
+                        byte_index <= 2'd0;
+
+                        packet_state <= PACKET_SEND;
+
+                    end
+
+                end
+
+
+                PACKET_SEND: begin
+
+                    if (!tx_busy) begin
+
+                        case (byte_index)
+
+                            2'd0:
+                                tx_data <= 8'hAA;
+
+                            2'd1:
+                                tx_data <= saved_status;
+
+                            2'd2:
+                                tx_data <= saved_frame;
+
+                            2'd3:
+                                tx_data <= saved_crc;
+
+                        endcase
+
+
+                        tx_start <= 1'b1;
+
+                        packet_state <= PACKET_WAIT;
+
+                    end
+
+                end
+
+
+                PACKET_WAIT: begin
+
+                    if (tx_done) begin
+
+                        if (byte_index == 2'd3) begin
+
+                            packet_state <= PACKET_DONE;
+
+                        end
+
+                        else begin
+
+                            byte_index <= byte_index + 1'b1;
+
+                            packet_state <= PACKET_SEND;
+
+                        end
+
+                    end
+
+                end
+
+
+                PACKET_DONE: begin
+
+                    packet_state <= PACKET_IDLE;
+
+                end
+
+
+                default: begin
+
+                    packet_state <= PACKET_IDLE;
+
+                end
+
+
+            endcase
+
+        end
+
+    end
+
+endmodule
+
+
+
+// ============================================================================
+// UART TRANSMITTER
+// 115200 baud
+// 8 data bits
+// No parity
+// 1 stop bit
+// ============================================================================
+
+module uart_tx #(
+    parameter integer CLK_FREQ_HZ = 100_000_000,
+    parameter integer BAUD_RATE   = 115_200
+)(
+    input wire clk,
+
+    input wire rst,
+
+    input wire [7:0] data_in,
+
+    input wire start,
+
+    output reg tx,
+
+    output reg busy,
+
+    output reg done
+);
+
+
+    localparam integer CLKS_PER_BIT =
+                    CLK_FREQ_HZ / BAUD_RATE;
+
+
+    reg [31:0] baud_counter;
+
+    reg [3:0] bit_counter;
+
+    reg [9:0] shift_register;
+
+
+    always @(posedge clk) begin
+
+        if (rst) begin
+
+            tx <= 1'b1;
+
+            busy <= 1'b0;
+
+            done <= 1'b0;
+
+            baud_counter <= 32'd0;
+
+            bit_counter <= 4'd0;
+
+            shift_register <= 10'h3FF;
+
+        end
+
+        else begin
+
+            done <= 1'b0;
+
+
+            if (!busy) begin
+
+                tx <= 1'b1;
+
+                baud_counter <= 32'd0;
+
+
+                if (start) begin
+
+                    // Stop + Data + Start
+
+                    shift_register <=
+                        {1'b1,data_in,1'b0};
+
+                    busy <= 1'b1;
+
+                    bit_counter <= 4'd0;
+
+                    tx <= 1'b0;
+
+                end
+
+            end
+
+
+            else if (baud_counter == CLKS_PER_BIT-1) begin
+
+                baud_counter <= 32'd0;
+
+
+                if (bit_counter == 4'd9) begin
+
+                    busy <= 1'b0;
+
+                    done <= 1'b1;
+
+                    tx <= 1'b1;
+
+                end
+
+                else begin
+
+                    bit_counter <= bit_counter + 1'b1;
+
+                    shift_register <=
+                        {1'b1,shift_register[9:1]};
+
+                    tx <= shift_register[1];
+
+                end
+
+            end
+
+
+            else begin
+
+                baud_counter <= baud_counter + 1'b1;
+
+            end
+
+        end
+
+    end
+
+endmodule
